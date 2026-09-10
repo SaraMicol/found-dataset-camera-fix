@@ -252,6 +252,8 @@ def merge_first_objects_itself(objects: MapObjectList, cfg):
     '''
     # print("Before merging:", len(objects))
     len_a = len(objects)
+    if len_a == 0:
+        return objects
     iou_similarities = compute_mask_iou_similarities(objects, objects)
     overlap_matrix = np.zeros((len_a, len_a))
 
@@ -307,6 +309,8 @@ def merge_curr_detection_itself(objects: DetectionList, cfg):
     '''
     # print("Before merging:", len(objects))
     len_a = len(objects)
+    if len_a == 0:
+        return objects
     iou_similarities = compute_mask_iou_similarities(objects, objects)
     overlap_matrix = np.zeros((len_a, len_a))
 
@@ -937,11 +941,8 @@ def update_curr_object_visibility_1(params: dict,
                         objects[i]['best_view'] = time_idx
                         objects[i]['mask'] = bool_mask
                         objects[i]['mask_area'] = mask_pixel_count
-                    plt.title("Boolean Mask")
-                    plt.title(f"Bool mask : {map_object['idx']}")  
-                    plt.imshow(bool_mask, cmap='gray')  
-                    plt.axis('off')
-                    plt.show()
+                    # Una finestra bloccante per oggetto per frame fermerebbe
+                    # la pipeline: lo stato si segue in utils/live_viewer.py.
 
     
     return objects
@@ -1169,7 +1170,7 @@ def compute_similarities_and_merge(detections: DetectionList,
         new_objects_idx = []
         privilege_object = []
         for detected_obj_idx, _ in enumerate(detections):
-            detections[detected_obj_idx]['idx'] = objects[-1]['idx'] + 1
+            detections[detected_obj_idx]['idx'] = objects[-1]['idx'] + 1 if len(objects) else 1
             objects.append(detections[detected_obj_idx])
             match_indices.append(len(objects) - 1)
             new_objects_idx.append(detections[detected_obj_idx]['idx'])
@@ -1227,19 +1228,16 @@ def check_update(color, depth, curr_cam_mapobjects, detections=None, cfg=None):
         if ssim_scores < 0.15:
             objects_to_remove.append(curr_obj['idx'])
 
-        vis1 =  curr_obj['color_mask'] * mask
+        # Confronto mappa attesa / vista reale: e' il segnale su cui si decide
+        # la rimozione. plt.show() bloccherebbe la pipeline a ogni oggetto.
+        vis1 = curr_obj['color_mask'] * mask
         vis2 = color * mask
-        plt.subplot(1, 2, 1) 
-        plt.title("dynamic changes")
-        plt.imshow(vis1.permute(1, 2, 0).detach().cpu().numpy())
-        plt.axis('off')
-
-        plt.subplot(1, 2, 2) 
-        plt.title("dynamic changes gt")
-        plt.imshow(vis2.permute(1, 2, 0).detach().cpu().numpy())
-        plt.axis('off')
-        plt.tight_layout()  # 自动调整子图间距
-        plt.show()
+        from utils import live_viewer
+        live_viewer.show_change(
+            vis1.permute(1, 2, 0).detach().cpu().numpy(),
+            vis2.permute(1, 2, 0).detach().cpu().numpy(),
+            curr_obj['idx'], float(ssim_scores),
+        )
 
     # iou_similarities = compute_mask_iou_similarities(curr_cam_mapobjects, detections, False)
     # features_similarities = compute_clip_features_similarities(curr_cam_mapobjects, detections)
@@ -1441,7 +1439,7 @@ def save_objects(params, objects: MapObjectList, dataset, ai_client, lf_config, 
             {"role": "user", "content": [{"type": "text", "text": obj_category_parse_prompt}]},
         ]
         chat_response = ai_client.chat.completions.create(
-            model="qwen2.5-vl-72b-instruct", messages=messages
+            model=lf_config.get("llm_model", "qwen2.5-vl-72b-instruct"), messages=messages
         )
         answer = chat_response.choices[0].message.content
         answer = answer.replace("'", '"')
@@ -1454,7 +1452,7 @@ def save_objects(params, objects: MapObjectList, dataset, ai_client, lf_config, 
             {"role": "user", "content": [{"type": "text", "text": obj_caption_parse_prompt}]},
         ]
         chat_response = ai_client.chat.completions.create(
-            model="qwen2.5-vl-72b-instruct", messages=messages
+            model=lf_config.get("llm_model", "qwen2.5-vl-72b-instruct"), messages=messages
         )
         answer = chat_response.choices[0].message.content
         answer = answer.replace("'", '"')

@@ -15,3 +15,5 @@ viz_scripts/gs_mind.py
 dgsg/
 .DS_Store
 __pycache__/
+*.log
+transformed_scene.png

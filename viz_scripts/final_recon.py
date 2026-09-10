@@ -21,6 +21,7 @@ from utils.common_utils import seed_everything
 from utils.recon_helpers import setup_camera
 from utils.slam_helpers import get_depth_and_silhouette
 from utils.slam_external import build_rotation
+from utils.walk_viz import smooth_walk_trajectory
 
 
 def load_camera(cfg, scene_path):
@@ -176,6 +177,14 @@ def visualize(scene_path, cfg):
     w2c, k = load_camera(cfg, scene_path)
 
     scene_data, scene_depth_data, all_w2cs = load_scene_data(scene_path, w2c, k)
+    if cfg.get('follow_walk', True):
+        walk_w2cs = smooth_walk_trajectory(
+            all_w2cs,
+            smooth_window=cfg.get('walk_smooth_window', 15),
+            eye_height=cfg.get('walk_eye_height', None),
+            level_camera=cfg.get('walk_level_camera', True),
+        )
+        w2c = np.array(walk_w2cs[0])
 
     # mask = scene_data['means3D'][:, 1] > -1
     # indices_z = torch.where(mask)[0]

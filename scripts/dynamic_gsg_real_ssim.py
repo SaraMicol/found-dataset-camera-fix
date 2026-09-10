@@ -14,7 +14,12 @@ for p in sys.path:
     print(p)
 
 import cv2
+import json
 import open3d as o3d
+import matplotlib
+# Le figure matplotlib residue sono diagnostiche e non devono aprire finestre
+# bloccanti: la vista live e' in utils/live_viewer.py (OpenCV).
+matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
 import torch
@@ -47,6 +52,7 @@ from datasets.gradslam_datasets import (load_dataset_config, ICLDataset, Replica
                                         ScannetDataset, Ai2thorDataset, Record3DDataset, RealsenseDataset, TUMDataset,
                                         ScannetPPDataset, NeRFCaptureDataset)
 from utils.common_utils import seed_everything, save_params_ckpt, save_params, save_variables
+from utils import live_viewer
 from utils.eval_helpers import report_loss, report_progress, eval
 from utils.keyframe_selection import keyframe_selection_overlap
 from utils.recon_helpers import setup_camera
@@ -428,6 +434,10 @@ def add_new_gaussians(params, variables, curr_data, curr_idx_mask: np.ndarray,
                                                    curr_data['features'], 
                                                    curr_data['intrinsics'], curr_w2c, mask=non_presence_mask, compute_mean_sq_dist=True,
                                                    mean_sq_dist_method=mean_sq_dist_method, with_objects=False)
+        if new_pt_cld.shape[0] > 15000:
+            _keep = torch.randperm(new_pt_cld.shape[0], device=new_pt_cld.device)[:15000]
+            new_pt_cld = new_pt_cld[_keep]
+            mean3_sq_dist = mean3_sq_dist[_keep]
         new_params = initialize_new_params(new_pt_cld, mean3_sq_dist, gaussian_distribution)
 
         if len(curr_objects_idx) > 0:
@@ -501,6 +511,50 @@ def convert_params_to_store(params):
         else:
             params_to_store[k] = v
     return params_to_store
+
+
+def _object_label(obj, classes=None):
+    """Nome leggibile per un oggetto del grafo: categoria LLM se gia'
+    assegnata, altrimenti la classe YOLO/RAM grezza, mai un idx nudo."""
+    category = obj.get('category')
+    if category:
+        return str(category)
+    class_id = obj.get('class_id')
+    if isinstance(class_id, (list, tuple)) and class_id:
+        class_id = class_id[0]
+    if classes is not None and class_id is not None:
+        try:
+            return str(classes[int(class_id)])
+        except (ValueError, IndexError, TypeError):
+            pass
+    return f"oggetto {obj['idx']}"
+
+
+def log_graph_state(output_dir, time_idx, objects, params, removed=None, classes=None):
+    """Append the current scene-graph state so a viewer can follow it live.
+
+    Diagnostic only: a failure here must never interrupt the pipeline.
+    """
+    try:
+        os.makedirs(output_dir, exist_ok=True)
+        entry = {
+            "frame": int(time_idx),
+            "num_objects": len(objects),
+            "num_gaussians": int(params['means3D'].shape[0]),
+            "objects": [
+                {
+                    "idx": int(o['idx']),
+                    "category": _object_label(o, classes),
+                    "detections": int(o.get('num_detections', 0)),
+                }
+                for o in objects
+            ],
+            "removed": [int(i) for i in (removed or [])],
+        }
+        with open(os.path.join(output_dir, "graph_stream.jsonl"), "a") as f:
+            f.write(json.dumps(entry) + "\n")
+    except Exception as exc:
+        print(f"[graph_stream] log non riuscito: {exc}")
 
 
 def dgsg(config: dict):
@@ -605,7 +659,8 @@ def dgsg(config: dict):
 
         
         ai_client = OpenAI(
-            api_key="YOUR QWEN API KEY",
+            api_key=lf_config.get("llm_api_key", "ollama"),
+            base_url=lf_config.get("llm_base_url", "http://localhost:11434/v1"),
         )
 
     # Init
@@ -626,6 +681,7 @@ def dgsg(config: dict):
     # Initialize list to keep track of Keyframes
     keyframe_list = []
     keyframe_time_indices = []
+    cached_detections = None
     
     # Init Variables to keep track of ground truth poses and runtimes
     gt_w2c_all_frames = []
@@ -819,10 +875,15 @@ def dgsg(config: dict):
                 print('Failed to evaluate trajectory.')
         
         
-        detections = process_this_frame_detection(rgb_image, time_idx,
-                                                  detection_model, ram_model, ai_client, sam_predictor, 
-                                                  clip_model, clip_preprocess, clip_tokenizer, 
-                                                  obj_classes, lf_config)
+        detect_every = lf_config.get('detect_every', 1)
+        if cached_detections is None or (time_idx % detect_every == 0):
+            detections = process_this_frame_detection(rgb_image, time_idx,
+                                                      detection_model, ram_model, ai_client, sam_predictor,
+                                                      clip_model, clip_preprocess, clip_tokenizer,
+                                                      obj_classes, lf_config)
+            cached_detections = detections
+        else:
+            detections = cached_detections
 
         if config['whether_to_update'] and time_idx >= dataset_config['frame_begin_update']:
             curr_objects = render_curr_frame_with_idx(params, time_idx, tracking_curr_data, objects, color_book, if_first_frame)
@@ -845,6 +906,12 @@ def dgsg(config: dict):
             objects_to_remove = check_update(color, depth, curr_objects, detections, lf_config)
 
             print(f"objects_to_remove: {objects_to_remove}")
+            if len(objects_to_remove) > 0:
+                log_graph_state(output_dir, time_idx, objects, params, removed=objects_to_remove, classes=obj_classes.get_classes_arr())
+                if config.get('live_viewer', True):
+                    live_viewer.show(rgb_image, detections, objects, time_idx,
+                                     params['means3D'].shape[0], removed=objects_to_remove,
+                                     classes=obj_classes.get_classes_arr())
 
             if len(objects_to_remove) > 0:
                 keyframe_list = []
@@ -913,7 +980,7 @@ def dgsg(config: dict):
                 save_params(params, before_update_save_path)
                 save_variables(variables, before_update_save_path)
                 save_keyframe_list(keyframe_list, before_update_save_path)
-                save_objects(objects, before_update_save_path)
+                save_objects(params, objects, dataset, ai_client, lf_config, before_update_save_path)
 
                 del params['timestep']
                 del params['intrinsics']
@@ -959,6 +1026,11 @@ def dgsg(config: dict):
                 curr_idx_mask = curr_data['idx_mask']
                 curr_data['curr_obj_idx'] = curr_obj_idx
                 print(f"frame {time_idx} num of objects: {len(objects)}")
+                log_graph_state(output_dir, time_idx, objects, params, classes=obj_classes.get_classes_arr())
+                if config.get('live_viewer', True):
+                    live_viewer.show(rgb_image, detections, objects, time_idx,
+                                     params['means3D'].shape[0],
+                                     classes=obj_classes.get_classes_arr())
                 # objects = update_curr_object_visibility(params, time_idx, tracking_curr_data, objects, color_book, if_first_frame)
 
                 post_num_pts = params['means3D'].shape[0]

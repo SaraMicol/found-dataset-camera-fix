@@ -25,6 +25,7 @@ from utils.slam_helpers import get_depth_and_silhouette
 from utils.slam_external import build_rotation
 
 from utils.map_objects_utils_up_with_groupv3 import read_color_book
+from utils.walk_viz import smooth_walk_trajectory
 
 def load_camera(cfg, scene_path):
     all_params = dict(np.load(scene_path, allow_pickle=True))
@@ -198,6 +199,15 @@ def visualize(scene_path, cfg, lf_cfg):
     first_frame_w2c, k = load_camera(cfg, scene_path)
 
     params, all_w2cs = load_scene_data(scene_path)
+    if cfg.get('follow_walk', True):
+        view_w2cs = smooth_walk_trajectory(
+            all_w2cs,
+            smooth_window=cfg.get('walk_smooth_window', 15),
+            eye_height=cfg.get('walk_eye_height', None),
+            level_camera=cfg.get('walk_level_camera', True),
+        )
+    else:
+        view_w2cs = all_w2cs
 
     color_book = read_color_book(lf_cfg['color_book_path'])
 
@@ -234,8 +244,9 @@ def visualize(scene_path, cfg, lf_cfg):
     view_k[2, 2] = 1
     view_control = vis.get_view_control()
     cparams = o3d.camera.PinholeCameraParameters()
-    first_view_w2c = first_frame_w2c
-    first_view_w2c[:3, 3] = first_view_w2c[:3, 3] + np.array([0, 0, 0.5])
+    first_view_w2c = np.array(view_w2cs[0])
+    if cfg.get('offset_first_viz_cam', True):
+        first_view_w2c[:3, 3] = first_view_w2c[:3, 3] + np.array([0, 0, 0.5])
     cparams.extrinsic = first_view_w2c
     cparams.intrinsic.intrinsic_matrix = view_k
     cparams.intrinsic.height = int(cfg['viz_h'] * cfg['view_scale'])
@@ -266,11 +277,11 @@ def visualize(scene_path, cfg, lf_cfg):
                 vis.remove_geometry(prev_lines)
         if not viz_start:
             vis.remove_geometry(prev_frustum)
-        new_frustum = o3d.geometry.LineSet.create_camera_visualization(w, h, k, all_w2cs[curr_timestep], frustum_size)
+        new_frustum = o3d.geometry.LineSet.create_camera_visualization(w, h, k, view_w2cs[curr_timestep], frustum_size)
         new_frustum.paint_uniform_color(np.array(cam_colormap(curr_timestep * norm_factor / num_t)[:3]))
         # vis.add_geometry(new_frustum)
         prev_frustum = new_frustum
-        cam_centers.append(np.linalg.inv(all_w2cs[curr_timestep])[:3, 3])
+        cam_centers.append(np.linalg.inv(view_w2cs[curr_timestep])[:3, 3])
         
         # Update Camera Trajectory
         if len(cam_centers) > 1 and curr_timestep > 0:
@@ -296,8 +307,7 @@ def visualize(scene_path, cfg, lf_cfg):
         view_k = cam_params.intrinsic.intrinsic_matrix
         k = view_k / cfg['view_scale']
         k[2, 2] = 1
-        view_w2c = cam_params.extrinsic
-        view_w2c = np.dot(first_view_w2c, all_w2cs[curr_timestep])
+        view_w2c = np.array(view_w2cs[curr_timestep])
         cam_params.extrinsic = view_w2c
         view_control.convert_from_pinhole_camera_parameters(cam_params, allow_arbitrary=True)
 
