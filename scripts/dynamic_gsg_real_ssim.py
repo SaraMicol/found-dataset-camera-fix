@@ -47,10 +47,10 @@ from utils.map_objects_utils_up_with_groupv3 import (
     save_keyframe_list,
     read_color_book,
 )
-from datasets.gradslam_datasets import (load_dataset_config, ICLDataset, ReplicaDataset, ReplicaV2Dataset, 
+from datasets.gradslam_datasets import (load_dataset_config, ICLDataset, ReplicaDataset, ReplicaV2Dataset,
                                         AzureKinectDataset, OrbbecDataset, HiSLAMDataset,
                                         ScannetDataset, Ai2thorDataset, Record3DDataset, RealsenseDataset, TUMDataset,
-                                        ScannetPPDataset, NeRFCaptureDataset)
+                                        ScannetPPDataset, NeRFCaptureDataset, RosLiveDataset)
 from utils.common_utils import seed_everything, save_params_ckpt, save_params, save_variables
 from utils import live_viewer
 from utils.eval_helpers import report_loss, report_progress, eval
@@ -99,6 +99,8 @@ def get_dataset(config_dict, basedir, sequence, **kwargs):
         return ScannetPPDataset(basedir, sequence, **kwargs)
     elif config_dict["dataset_name"].lower() in ["nerfcapture"]:
         return NeRFCaptureDataset(basedir, sequence, **kwargs)
+    elif config_dict["dataset_name"].lower() in ["ros_live"]:
+        return RosLiveDataset(config_dict, basedir, sequence, **kwargs)
     else:
         raise ValueError(f"Unknown dataset name {config_dict['dataset_name']}")
 
@@ -179,7 +181,16 @@ def initialize_params(init_pt_cld, num_frames, mean3_sq_dist, gaussian_distribut
         'means3D': means3D,
         'rgb_colors': init_pt_cld[:, 3:6],
         'features': init_pt_cld[:, 6:9],
-        'object_idx': init_pt_cld[:, 9:].detach().cpu().numpy().astype(np.uint8),
+        # int32, non uint8: uint8 satura a 255 e l'idx 256 torna a 0, cosi'
+        # le gaussiane di un oggetto finiscono assegnate all'idx sbagliato e
+        # select_idx_gaussian non ne trova piu' nessuna -> render a 0 pixel
+        # -> l'oggetto sparisce dal pool di confronto di
+        # compute_similarities_and_merge -> ogni detection ricrea un nodo
+        # nuovo (misurato sulla scena 824: 6040 "Skipping object ... (0)" e
+        # 17 nodi "pillow" tutti con detections=1). Vedi anche il dtype di
+        # curr_idx_mask in utils/map_objects_utils_up_with_groupv3.py, che
+        # era int8 e saturava ancora prima, a 127.
+        'object_idx': init_pt_cld[:, 9:].detach().cpu().numpy().astype(np.int32),
         'unnorm_rotations': unnorm_rots,
         'logit_opacities': logit_opacities,
         'log_scales': log_scales,
@@ -382,7 +393,10 @@ def initialize_new_params(new_pt_cld, mean3_sq_dist, gaussian_distribution):
         'means3D': means3D,
         'rgb_colors': new_pt_cld[:, 3:6],
         'features': new_pt_cld[:, 6:9],
-        'object_idx': new_pt_cld[:, 9:].detach().cpu().numpy().astype(np.uint8),
+        # int32: vedi il commento in initialize_first_timestep_gaussian_classes
+        # (stesso bug di overflow, stesso campo, qui per le gaussiane
+        # aggiunte a ogni frame invece che per quelle iniziali).
+        'object_idx': new_pt_cld[:, 9:].detach().cpu().numpy().astype(np.int32),
         'unnorm_rotations': unnorm_rots,
         'logit_opacities': logit_opacities,
         'log_scales': log_scales,
@@ -398,7 +412,7 @@ def initialize_new_params(new_pt_cld, mean3_sq_dist, gaussian_distribution):
     return params
 
 
-def add_new_gaussians(params, variables, curr_data, curr_idx_mask: np.ndarray, 
+def add_new_gaussians(params, variables, curr_data, curr_idx_mask: np.ndarray,
                       curr_objects_idx: list, new_objects_idx: list, privilege_object: list, objects : MapObjectList,
                       sil_thres, time_idx, mean_sq_dist_method, gaussian_distribution, lf_config):
     # Silhouette Rendering
@@ -431,7 +445,7 @@ def add_new_gaussians(params, variables, curr_data, curr_idx_mask: np.ndarray,
         valid_depth_mask = (curr_data['depth'][0, :, :] > 0)
         non_presence_mask = non_presence_mask & valid_depth_mask.reshape(-1)
         new_pt_cld, mean3_sq_dist = get_pointcloud(curr_data['im'], curr_data['depth'], torch.from_numpy(curr_idx_mask).unsqueeze(-1),
-                                                   curr_data['features'], 
+                                                   curr_data['features'],
                                                    curr_data['intrinsics'], curr_w2c, mask=non_presence_mask, compute_mean_sq_dist=True,
                                                    mean_sq_dist_method=mean_sq_dist_method, with_objects=False)
         if new_pt_cld.shape[0] > 15000:
@@ -441,15 +455,15 @@ def add_new_gaussians(params, variables, curr_data, curr_idx_mask: np.ndarray,
         new_params = initialize_new_params(new_pt_cld, mean3_sq_dist, gaussian_distribution)
 
         if len(curr_objects_idx) > 0:
-            curr_objects_pcd = get_curr_objects_pcd(curr_data['depth'], torch.from_numpy(curr_idx_mask).unsqueeze(-1), 
-                                                    curr_objects_idx, curr_data['intrinsics'], curr_w2c)         
+            curr_objects_pcd = get_curr_objects_pcd(curr_data['depth'], torch.from_numpy(curr_idx_mask).unsqueeze(-1),
+                                                    curr_objects_idx, curr_data['intrinsics'], curr_w2c)
             for k, v in new_params.items():
                 if k != 'object_idx':
                     params[k] = torch.nn.Parameter(torch.cat((params[k], v), dim=0).requires_grad_(True))
                 else:
-                    params[k] = np.concatenate((params[k], v), axis=0)            
+                    params[k] = np.concatenate((params[k], v), axis=0)
 
-            params, invaild_new_objects_idx = update_curr_objects_gaussians(params, objects, curr_objects_pcd, 
+            params, invaild_new_objects_idx = update_curr_objects_gaussians(params, objects, curr_objects_pcd,
                                                                             new_objects_idx, privilege_object, lf_config, time_idx)
 
             objects, curr_obj_idx, curr_data = slice_invaild_new_objects(invaild_new_objects_idx, objects, curr_objects_idx, curr_data)
@@ -464,6 +478,21 @@ def add_new_gaussians(params, variables, curr_data, curr_idx_mask: np.ndarray,
                     params[k] = torch.nn.Parameter(torch.cat((params[k], v), dim=0).requires_grad_(True))
                 else:
                     params[k] = np.concatenate((params[k], v), axis=0)
+
+            # Qui curr_objects_idx e' vuoto, quindi update_curr_objects_gaussians
+            # non gira e NESSUNA gaussiana riceve un object_idx. Gli oggetti
+            # appena creati in questo frame restano pero' nella lista objects,
+            # senza una sola gaussiana: render_curr_frame_with_idx li
+            # rasterizza a 0 pixel, quindi spariscono dal pool di confronto di
+            # compute_similarities_and_merge e la detection successiva dello
+            # stesso oggetto fisico ne crea un altro da capo. E' la spirale che
+            # produceva i duplicati (misurato sulla scena 824: 160 oggetti su
+            # 217 con n_gauss=0, 17 nodi "pillow" tutti con detections=1).
+            # Vanno scartati subito, come gia' fa slice_invaild_new_objects nel
+            # ramo sopra per gli oggetti che non superano le soglie.
+            if new_objects_idx:
+                objects = MapObjectList([o for o in objects if o['idx'] not in new_objects_idx])
+                curr_obj_idx = [c for c in curr_obj_idx if c not in new_objects_idx]
 
         
             
@@ -515,10 +544,22 @@ def convert_params_to_store(params):
 
 def _object_label(obj, classes=None):
     """Nome leggibile per un oggetto del grafo: categoria LLM se gia'
-    assegnata, altrimenti la classe YOLO/RAM grezza, mai un idx nudo."""
+    assegnata, altrimenti la classe YOLO/RAM grezza, mai un idx nudo.
+
+    class_name (se presente) e' gia' risolto in process_this_frame_detection
+    col vocabolario giusto -- i tag RAM del frame in cui l'oggetto e' stato
+    trovato per GroundingDINO, ScanNet200 per YOLO -- e va preferito. Il
+    fallback su classes[class_id] resta solo per oggetti caricati da uno
+    stato salvato prima di questo fix, che non hanno ancora class_name: li'
+    'classes' e' quasi sempre ScanNet200 (vedi chiamate a log_graph_state),
+    disallineato rispetto a class_id se l'oggetto viene da GroundingDINO.
+    """
     category = obj.get('category')
     if category:
         return str(category)
+    class_name = obj.get('class_name')
+    if class_name:
+        return str(class_name)
     class_id = obj.get('class_id')
     if isinstance(class_id, (list, tuple)) and class_id:
         class_id = class_id[0]
@@ -530,13 +571,59 @@ def _object_label(obj, classes=None):
     return f"oggetto {obj['idx']}"
 
 
-def log_graph_state(output_dir, time_idx, objects, params, removed=None, classes=None):
+def log_graph_state(output_dir, time_idx, objects, params, removed=None, classes=None, first_frame_c2w=None):
     """Append the current scene-graph state so a viewer can follow it live.
 
     Diagnostic only: a failure here must never interrupt the pipeline.
     """
     try:
         os.makedirs(output_dir, exist_ok=True)
+        # Centroide 3D per oggetto: media delle gaussiane con quel object_idx
+        # (stesso pattern di select_idx_gaussian in
+        # utils/map_objects_utils_up_with_groupv3.py:791). E' l'unico segnale
+        # che permette di distinguere due oggetti della STESSA categoria
+        # (es. due banane): la category e persino il clip_ft possono essere
+        # identici tra un oggetto preesistente in scena e uno spawnato dallo
+        # script -- solo la posizione li separa (vedi
+        # scripts/watch_gt_vs_graph.py, matching per centroide).
+        #
+        # I means3D vivono nel mondo del pipeline, che e' ancorato alla
+        # camera del frame 0 (dataset relative_pose=True, vedi
+        # initialize_first_timestep). La ground truth (gt-log, script di
+        # cammino) e' invece in coordinate world Habitat. first_frame_c2w
+        # (inversa di first_frame_w2c) e' la trasformazione che riporta i
+        # punti dal mondo pipeline al mondo Habitat, cosi' il centroide qui
+        # loggato e' diretttamente comparabile con "position" nel gt-log.
+        object_idx_arr = params.get('object_idx')
+        means3D = params.get('means3D')
+        c2w_np = None
+        if first_frame_c2w is not None:
+            c2w_np = first_frame_c2w.detach().cpu().numpy() if hasattr(first_frame_c2w, 'detach') else np.asarray(first_frame_c2w)
+
+        def _centroid_habitat(obj_idx):
+            if object_idx_arr is None or means3D is None:
+                return None
+            mask = (object_idx_arr == obj_idx)
+            if hasattr(mask, 'detach'):
+                mask = mask.detach().cpu().numpy()
+            mask = np.asarray(mask)
+            # object_idx e' salvato come colonna (N,1) (slice init_pt_cld[:, 9:]),
+            # non (N,): va appiattito, altrimenti l'indicizzazione booleana su
+            # means3D (N,3) fallisce per shape mismatch (visto in log:
+            # "mask [N, 1] ... indexed tensor [N, 3]").
+            mask = mask.reshape(-1)
+            if not mask.any():
+                return None
+            pts = means3D[mask]
+            if hasattr(pts, 'detach'):
+                pts = pts.detach().cpu().numpy()
+            centroid_pipeline = np.asarray(pts).mean(axis=0)
+            if c2w_np is None:
+                return centroid_pipeline.tolist()
+            centroid_h = np.concatenate([centroid_pipeline, [1.0]])
+            centroid_habitat = (c2w_np @ centroid_h)[:3]
+            return centroid_habitat.tolist()
+
         entry = {
             "frame": int(time_idx),
             "num_objects": len(objects),
@@ -546,6 +633,20 @@ def log_graph_state(output_dir, time_idx, objects, params, removed=None, classes
                     "idx": int(o['idx']),
                     "category": _object_label(o, classes),
                     "detections": int(o.get('num_detections', 0)),
+                    # Embedding CLIP visuale gia' calcolato dalla pipeline
+                    # per il matching interno (vedi 'clip_ft' in
+                    # utils/map_objects_utils_up_with_groupv3.py, gia'
+                    # normalizzato: cosine sim = dot product) -- permette un
+                    # confronto per embedding con la ground truth (invece
+                    # del solo match testuale per parole), vedi
+                    # scripts/watch_gt_vs_graph.py. NOTA: due oggetti della
+                    # stessa categoria fisica hanno clip_ft praticamente
+                    # identico (cosine ~1.0) -- da solo NON basta a
+                    # distinguerli, va usato insieme a "centroid".
+                    "clip_ft": o['clip_ft'].tolist() if o.get('clip_ft') is not None else None,
+                    # Posizione 3D (mondo Habitat, vedi sopra) o None se non
+                    # calcolabile per questo oggetto in questo frame.
+                    "centroid": _centroid_habitat(int(o['idx'])),
                 }
                 for o in objects
             ],
@@ -675,6 +776,13 @@ def dgsg(config: dict):
                                                                                     config['scene_radius_depth_ratio'],
                                                                                     config['mean_sq_dist_method'],
                                                                                     gaussian_distribution=config['gaussian_distribution'])
+    # Inversa di first_frame_w2c: porta i punti dal mondo del pipeline
+    # (ancorato alla camera del frame 0, vedi initialize_first_timestep /
+    # relative_pose=True) al mondo Habitat/world in cui e' espressa la
+    # ground truth (gt-log dello script di cammino). Usata solo per
+    # loggare il centroide degli oggetti in log_graph_state -- diagnostico,
+    # vedi scripts/watch_gt_vs_graph.py.
+    first_frame_c2w = torch.linalg.inv(first_frame_w2c)
 
 
     
@@ -907,7 +1015,7 @@ def dgsg(config: dict):
 
             print(f"objects_to_remove: {objects_to_remove}")
             if len(objects_to_remove) > 0:
-                log_graph_state(output_dir, time_idx, objects, params, removed=objects_to_remove, classes=obj_classes.get_classes_arr())
+                log_graph_state(output_dir, time_idx, objects, params, removed=objects_to_remove, classes=obj_classes.get_classes_arr(), first_frame_c2w=first_frame_c2w)
                 if config.get('live_viewer', True):
                     live_viewer.show(rgb_image, detections, objects, time_idx,
                                      params['means3D'].shape[0], removed=objects_to_remove,
@@ -924,10 +1032,35 @@ def dgsg(config: dict):
                     object_pcd_tensor = params['means3D'][indices].detach()
                     # convex = points_inside_convex_hull(object_pcd_tensor, remove_outliers=True, outlier_factor=1.0)
                     object_pcd_np = object_pcd_tensor.detach().cpu().numpy()
+
+                    # get_oriented_bounding_box() costruisce un convex hull, che
+                    # richiede ALMENO 4 punti non complanari: con meno, qhull
+                    # solleva "QH6214 ... not enough points(N) to construct
+                    # initial simplex (need 4)" e l'intera run muore. Succede
+                    # davvero: la 824 e' morta cosi' al frame 323 su un oggetto
+                    # rimosso che aveva 2 sole gaussiane. Un oggetto cosi'
+                    # degenere non ha un volume da cui raccogliere punti di
+                    # sfondo circostanti: si rimuovono direttamente le sue
+                    # gaussiane, senza allargamento del bounding box.
+                    if object_pcd_np.shape[0] < 4:
+                        print(f"Oggetto {obj}: solo {object_pcd_np.shape[0]} punti, "
+                              f"niente bounding box orientato (ne servono 4) -- "
+                              f"rimuovo solo le sue gaussiane")
+                        all_indices.append(indices)
+                        continue
+
                     object_pcd = o3d.geometry.PointCloud()
                     object_pcd.points = o3d.utility.Vector3dVector(object_pcd_np)
 
-                    bbox = object_pcd.get_oriented_bounding_box()
+                    try:
+                        bbox = object_pcd.get_oriented_bounding_box()
+                    except RuntimeError as exc:
+                        # Anche con >=4 punti qhull fallisce se sono complanari
+                        # o collineari (simplex degenere). Stesso trattamento.
+                        print(f"Oggetto {obj}: bounding box non calcolabile "
+                              f"({exc.__class__.__name__}) -- rimuovo solo le sue gaussiane")
+                        all_indices.append(indices)
+                        continue
                     center = bbox.center
                     extent = np.array(bbox.extent) 
                     rotation = bbox.R
@@ -995,14 +1128,14 @@ def dgsg(config: dict):
         curr_cam_mapobjects = render_curr_frame_with_idx(params, time_idx, tracking_curr_data, objects, color_book, if_first_frame)
 
         H, W = color.shape[1], color.shape[2]
-        curr_idx_mask, curr_features_mask, objects, curr_objects_idx, new_objects_idx, privilege_object = compute_similarities_and_merge(detections, 
-                                                                                                            curr_cam_mapobjects, 
-                                                                                                            objects, 
+        curr_idx_mask, curr_features_mask, objects, curr_objects_idx, new_objects_idx, privilege_object = compute_similarities_and_merge(detections,
+                                                                                                            curr_cam_mapobjects,
+                                                                                                            objects,
                                                                                                             color_book,
                                                                                                             lf_config,
                                                                                                             time_idx,
                                                                                                             H, W)
-        
+
         curr_data['features'] = curr_features_mask
         curr_data['idx_mask'] = curr_idx_mask
         if if_first_frame:
@@ -1017,7 +1150,7 @@ def dgsg(config: dict):
                 densify_curr_data = curr_data
 
                 # Add new Gaussians to the scene based on the Silhouetteget_pointcloud
-                params, variables, objects, curr_obj_idx, curr_data = add_new_gaussians(params, variables, densify_curr_data, 
+                params, variables, objects, curr_obj_idx, curr_data = add_new_gaussians(params, variables, densify_curr_data,
                                                                curr_idx_mask, curr_objects_idx, new_objects_idx, privilege_object, objects,
                                                                config['mapping']['sil_thres'], time_idx,
                                                                config['mean_sq_dist_method'], config['gaussian_distribution'],
@@ -1026,7 +1159,7 @@ def dgsg(config: dict):
                 curr_idx_mask = curr_data['idx_mask']
                 curr_data['curr_obj_idx'] = curr_obj_idx
                 print(f"frame {time_idx} num of objects: {len(objects)}")
-                log_graph_state(output_dir, time_idx, objects, params, classes=obj_classes.get_classes_arr())
+                log_graph_state(output_dir, time_idx, objects, params, classes=obj_classes.get_classes_arr(), first_frame_c2w=first_frame_c2w)
                 if config.get('live_viewer', True):
                     live_viewer.show(rgb_image, detections, objects, time_idx,
                                      params['means3D'].shape[0],
@@ -1189,6 +1322,26 @@ def dgsg(config: dict):
         # Increment WandB Time Step
         if config['use_wandb']:
             wandb_time_step += 1
+
+        # Salvataggio periodico di variables.npz/keyframelist.pkl.gz per il
+        # viewer live (viz_scripts/online_recon.py), che li legge una volta
+        # all'avvio: senza questo, il grafo sarebbe visibile solo a fine
+        # run (save_variables/save_keyframe_list, righe ~1266-1267). Stesse
+        # funzioni gia' usate a fine run, chiamate qui anche a meta' —
+        # nessuna nuova logica di serializzazione. Attivo solo se il
+        # dataset e' il bridge live (stesso guard di notify_consumed sotto):
+        # per i run da file non serve, il viewer si apre gia' post-hoc.
+        if hasattr(dataset, "notify_consumed") and time_idx % config['keyframe_every'] == 0:
+            save_variables(variables, output_dir)
+            save_keyframe_list(keyframe_list, output_dir)
+
+        # Bridge live (RosLiveDataset, datasets/gradslam_datasets/ros_live.py):
+        # sblocca lo script di cammino, che aspetta questo ack prima di
+        # mandare il frame successivo (lock-step scelto esplicitamente
+        # dall'utente). Nessun impatto sugli altri dataset (da file): quelli
+        # non hanno notify_consumed, il ramo non scatta.
+        if hasattr(dataset, "notify_consumed"):
+            dataset.notify_consumed(time_idx)
 
         torch.cuda.empty_cache()
 

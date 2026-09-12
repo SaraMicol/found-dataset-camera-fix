@@ -49,13 +49,59 @@ config = dict(
         basedir="./data/FOUND",
         gradslam_data_cfg="./configs/data/found.yaml",
         sequence=scene_name,
-        desired_image_height=480,
-        desired_image_width=640,
+        # Dimezzata da 480x640 (default): due run indipendenti su 1453
+        # frame sono morte di CUDA OOM sempre intorno a ~1.95-1.96M
+        # gaussiane (frame 207 e 216), con la GPU tutta per la pipeline,
+        # nessuna concorrenza -- non e' stato un incidente, e' il tasso di
+        # crescita per-frame che sulla lunghezza intera della sequenza
+        # esaurisce i 16GB prima della fine. Il pruning
+        # (mapping.pruning_dict) e' pensato per sequenze corte (i config
+        # noti usano num_frames=40) e non tiene il passo su 1453 frame.
+        # Toccare quella logica stanotte senza poterla validare e' piu'
+        # rischioso che ridurre il numero di pixel: meta' risoluzione ->
+        # un quarto dei pixel proiettati per frame -> gaussiane nuove
+        # aggiunte per frame proporzionalmente ridotte, a parita' di
+        # logica di ottimizzazione/pruning. ReplicaDataset (dataset_name
+        # 'replica' in found.yaml) fa resize reale qui (vedi
+        # basedataset.py::_preprocess_color/_preprocess_depth), quindi il
+        # taglio e' effettivo, non solo dichiarato.
+        desired_image_height=240,
+        desired_image_width=320,
         start=0,
         end=-1,
-        stride=1,
-        num_frames=1453,
-        frame_begin_update=517,
+        # stride=2 (un frame su due) e' la seconda leva contro l'OOM, dopo
+        # removal_opacity_threshold=0.3. Misurato: la soglia da sola porta
+        # il tasso da ~3945 a ~2371 gaussiane/frame (-40%), ma proiettato
+        # su 1453 frame fa ancora ~3.44M, sopra il tetto osservato di
+        # ~1.95M. Con stride=2 i frame processati diventano 726 e la
+        # proiezione scende a ~1.72M: sotto il tetto, con margine.
+        #
+        # Perche' stride e NON un taglio di num_frames: basedataset.py:182-188
+        # applica lo stride a color/depth/poses insieme, quindi la sequenza
+        # resta COMPLETA dall'inizio alla fine, solo campionata a meta'
+        # cadenza. La fase dinamica resta esattamente nella stessa
+        # posizione relativa (36% della sequenza, frame 258 di 726 invece
+        # di 517 di 1453): tutti gli spawn/move/remove restano coperti.
+        # Tagliare num_frames a ~290 (l'altra opzione per stare sotto il
+        # tetto) avrebbe invece fermato la run PRIMA di frame_begin_update,
+        # senza osservare nemmeno un cambiamento.
+        stride=2,
+        # ATTENZIONE: questi due valori sono espressi in INDICI DEL DATASET
+        # GIA' CAMPIONATO (post-stride), non in frame grezzi del disco.
+        # Il dataset registrato ha 1453 frame e frame_begin_update=517
+        # (dynamic_meta.json), ma con stride=2 basedataset.py tiene un
+        # frame su due -> restano 727 item, e l'evento dinamico cade
+        # all'indice 258.
+        #
+        # Perche' conta: il loop di dgsg() itera su range(num_frames) e la
+        # riga 969 confronta quel contatore con frame_begin_update. Sono
+        # entrambi indici del dataset campionato. Lasciando i valori grezzi:
+        #   - num_frames=1453 > 727 item disponibili -> IndexError a fine run;
+        #   - frame_begin_update=517 farebbe partire il controllo dinamico
+        #     al 71% della sequenza invece che al 35%, mancando gran parte
+        #     degli spawn/move/remove da misurare.
+        num_frames=727,
+        frame_begin_update=258,
         ignore_bad = False,
         use_train_split = True,
     ),
@@ -106,13 +152,37 @@ config = dict(
             cam_trans=0.0000,
         ),
         prune_gaussians=True, # Prune Gaussians during Mapping
+        # Reso piu' aggressivo dopo tre OOM su sequenze da 1453 frame (vedi
+        # nota su desired_image_height/width sopra). Due tentativi
+        # progressivi, entrambi misurati su dati reali della stessa scena:
+        #   1) solo dimezzare la risoluzione -> 6242 gaussiane/frame nette,
+        #      OOM proiettato al frame ~365.
+        #   2) + aumentare la frequenza di pruning (stop_after 20->60,
+        #      prune_every 20->10, 7 potature/frame invece di 1) -> NESSUN
+        #      cambiamento misurabile (frame 148: 583908 vs 597160
+        #      gaussiane della prova precedente). La frequenza non era il
+        #      collo di bottiglia: con removal_opacity_threshold=0.005
+        #      (sigmoid dell'opacita' < 0.005, quasi trasparente) quasi
+        #      nessuna gaussiana la attraversa mai, quindi ripetere il
+        #      controllo piu' spesso non cambia chi viene rimosso.
+        # Qui si alza la soglia stessa di due ordini di grandezza (0.3):
+        # rimuove le gaussiane debolmente opache, non solo quelle
+        # praticamente invisibili. Rischio esplicito e non nascosto: una
+        # soglia cosi' alta puo' rimuovere anche gaussiane valide non
+        # ancora convergenti, con un impatto sulla qualita' della
+        # ricostruzione che qui non e' stato validato visivamente --
+        # scelta fatta perche' l'alternativa (limitare num_frames a un
+        # valore sicuro, ~290 stimati) taglierebbe la sequenza PRIMA di
+        # frame_begin_update=517, cioe' prima che inizi la parte dinamica
+        # da misurare: uno zero garantito e' peggio di una ricostruzione
+        # via via piu' scarna ma completa fino in fondo.
         pruning_dict=dict( # Needs to be updated based on the number of mapping iterations
             start_after=0,
             remove_big_after=0,
-            stop_after=20,
-            prune_every=20,
-            removal_opacity_threshold=0.005,
-            final_removal_opacity_threshold=0.005,
+            stop_after=60,
+            prune_every=10,
+            removal_opacity_threshold=0.3,
+            final_removal_opacity_threshold=0.3,
             reset_opacities=False,
             reset_opacities_every=500, # Doesn't consider iter 0
         ),
@@ -141,6 +211,19 @@ config = dict(
         llm_base_url="http://localhost:11434/v1",
         llm_api_key="ollama",
         llm_model="gemma3:4b",
+        # DAM-3B disattivato: veniva caricato su cuda:0 da save_objects()
+        # mentre GroundingDINO, SAM, RAM, CLIP e le gaussiane erano gia'
+        # residenti, ed e' la causa reale di TUTTI gli OOM di questa notte
+        # (traceback: dynamic_gsg_real_ssim.py:1064 -> save_objects ->
+        # vision_tower.to(cuda) -> 12.4 GiB su 15.47 disponibili). Il crash
+        # cadeva sempre a frame_begin_update perche' e' li' che il loop
+        # chiama save_objects la prima volta, non per le gaussiane, che nei
+        # test erano stabili a ~150k e in calo.
+        # Serve solo a generare obj['description'] e a riscrivere
+        # obj['category'] via LLM: nessuno dei due entra nelle metriche
+        # spawn/move/remove, che leggono idx/category/centroid/clip_ft da
+        # graph_stream.jsonl (scritto da log_graph_state, indipendente).
+        use_dam=False,
         dam_model_path='nvidia/DAM-3B',
         dam_conv_mode="v1",
         dam_prompt_mode="focal_prompt",

@@ -45,14 +45,20 @@ def read_color_book(color_book_path: str):
 
 
 def compute_clip_features_batched(image, detections, clip_model, clip_preprocess, clip_tokenizer, classes, device):
-    
+    """classes non serve piu' qui: incoraggiava a costruire i text token con
+    classes[class_id], indicizzando il vocabolario ScanNet200 fisso passato
+    dal chiamante con un class_id che per GroundingDINO viene dal vocabolario
+    RAM del frame (dimensione diversa, rischio concreto di IndexError). Il
+    risultato (text_feats) non era comunque mai usato: encode_text() era
+    commentato e filter_gobs() scarta esplicitamente 'text_feats'. Il
+    parametro resta in firma solo per non rompere le due chiamate esistenti.
+    """
     image = Image.fromarray(image)
     padding = 20  # Adjust the padding amount as needed
-    
+
     image_crops = []
     preprocessed_images = []
-    text_tokens = []
-    
+
     # Prepare data for batch processing
     for idx in range(len(detections.xyxy)):
         x_min, y_min, x_max, y_max = detections.xyxy[idx]
@@ -70,29 +76,20 @@ def compute_clip_features_batched(image, detections, clip_model, clip_preprocess
         cropped_image = image.crop((x_min, y_min, x_max, y_max))
         preprocessed_image = clip_preprocess(cropped_image).unsqueeze(0)
         preprocessed_images.append(preprocessed_image)
-
-        class_id = detections.class_id[idx]
-        text_tokens.append(classes[class_id])
         image_crops.append(cropped_image)
-    
+
     # Convert lists to batches  B 3 224 224
-    preprocessed_images_batch = torch.cat(preprocessed_images, dim=0).to(device)   
-    text_tokens_batch = clip_tokenizer(text_tokens).to(device)
-    
+    preprocessed_images_batch = torch.cat(preprocessed_images, dim=0).to(device)
+
     # Batch inference
     with torch.no_grad():
         image_features = clip_model.encode_image(preprocessed_images_batch)
         image_features /= image_features.norm(dim=-1, keepdim=True)
-        
-        # text_features = clip_model.encode_text(text_tokens_batch)
-        # text_features /= text_features.norm(dim=-1, keepdim=True)
-    
+
     # Convert to numpy
     image_feats = image_features.cpu().numpy()
-    # text_feats = text_features.cpu().numpy()
-    # image_feats = []
     text_feats = []
-    
+
     return image_crops, image_feats, text_feats
 
 
@@ -430,34 +427,43 @@ def initialize_first_timestep_gaussian_classes(
         ram_model.eval()
         text_prompt = inference(raw_image, ram_model)[0].replace(' | ', '.')
         classes = process_tag_classes(text_prompt=text_prompt)
+        # detection_class_ids (sotto) indicizza QUESTA lista (i tag RAM di
+        # questo frame, es. "banana, bowl, spoon..."), non
+        # obj_classes.get_classes_arr() (i 199 nomi fissi di ScanNet200).
+        # detection_vocab tiene traccia del vocabolario vero usato per la
+        # detection: va passato piu' sotto in "classes", altrimenti
+        # filter_gobs() risolve il nome indicizzando un elenco diverso da
+        # quello usato per trovare l'oggetto, con un'etichetta risultante
+        # presa a caso da ScanNet200 (es. "wardrobe" per una banana vera).
+        detection_vocab = classes
 
-        detections_gd = detection_model.predict_with_classes(    
+        detections_gd = detection_model.predict_with_classes(
                 image=cv2.cvtColor(image, cv2.COLOR_RGB2BGR), # This function expects a BGR image...
                 classes=classes,
                 box_threshold=0.3,
                 text_threshold=0.3
             )
-        
+
         if len(detections_gd.class_id) > 0:
             ### Non-maximum suppression ###
             print(f"Before NMS: {len(detections_gd.xyxy)} boxes")
             nms_idx = ops.nms(
-                torch.from_numpy(detections_gd.xyxy), 
-                torch.from_numpy(detections_gd.confidence), 
+                torch.from_numpy(detections_gd.xyxy),
+                torch.from_numpy(detections_gd.confidence),
                 0.5
             ).numpy().tolist()
             print(f"After NMS: {len(detections_gd.xyxy)} boxes")
             detections_gd.xyxy = detections_gd.xyxy[nms_idx]
             detections_gd.confidence = detections_gd.confidence[nms_idx]
             detections_gd.class_id = detections_gd.class_id[nms_idx]
-            
+
             # Somehow some detections will have class_id=-1, remove them
             # valid_idx = detections.class_id != -1
             valid_idx = [i for i, val in enumerate(detections_gd.class_id) if (val is not None and val != -1)]
             detections_gd.xyxy = detections_gd.xyxy[valid_idx]
             detections_gd.confidence = detections_gd.confidence[valid_idx]
             detections_gd.class_id = detections_gd.class_id[valid_idx]
-            
+
             confidences = detections_gd.confidence
             detection_class_ids = detections_gd.class_id.astype(int)
             xyxy_np = detections_gd.xyxy
@@ -469,6 +475,11 @@ def initialize_first_timestep_gaussian_classes(
         detection_class_labels = [f"{obj_classes.get_classes_arr()[class_id]} {class_idx}" for class_idx, class_id in enumerate(detection_class_ids)]
         xyxy_tensor = results[0].boxes.xyxy
         xyxy_np = xyxy_tensor.cpu().numpy()
+        # Ramo YOLO: qui detection_class_ids indicizza davvero
+        # obj_classes.get_classes_arr() (detection_model.set_classes(...) e'
+        # stato inizializzato con quello stesso elenco), quindi qui e'
+        # corretto e resta il vocabolario da passare in "classes".
+        detection_vocab = obj_classes.get_classes_arr()
 
     # if there are detections,
     # Get Masks Using SAM or MobileSAM
@@ -485,18 +496,18 @@ def initialize_first_timestep_gaussian_classes(
         class_id=detection_class_ids,
         mask=masks_np,
     )
-    
+
     image_crops, image_feats, text_feats = compute_clip_features_batched(
                 image, curr_det, clip_model, clip_preprocess, clip_tokenizer, obj_classes.get_classes_arr(), device='cuda')
-    
+
 
     results = {
-        # add new uuid for each detection 
+        # add new uuid for each detection
         "xyxy": curr_det.xyxy,
         "confidence": curr_det.confidence,
         "class_id": curr_det.class_id,
         "mask": curr_det.mask,
-        "classes": obj_classes.get_classes_arr(),
+        "classes": detection_vocab,
         "image_crops": image_crops,
         "image_feats": image_feats,
         "text_feats": text_feats,
@@ -534,14 +545,28 @@ def initialize_first_timestep_gaussian_classes(
         objects.append(map_object)
 
     objects = merge_first_objects_itself(objects, cfg)
-    idx_mask = np.zeros((color.shape[0], color.shape[1]), dtype=np.int8) 
+    # int32, non int8: int8 arriva a 127, quindi dall'oggetto 128 in poi
+    # l'idx scritto qui diventa negativo (128 -> -128, 200 -> -56) e non
+    # corrisponde piu' a nessun oggetto reale. Le gaussiane create da questa
+    # maschera ereditano l'idx sbagliato, select_idx_gaussian non le ritrova
+    # e l'oggetto si rasterizza a 0 pixel: sparisce dal pool di confronto e
+    # ogni nuova detection lo ricrea da capo, generando la valanga di
+    # duplicati osservata sulla scena 824 (17 "pillow", 12 "picture", ...).
+    idx_mask = np.zeros((color.shape[0], color.shape[1]), dtype=np.int32)
     # 构建一个表示特征颜色的tensor
     feature_mask = torch.zeros((color.shape[0], color.shape[1], 3), dtype=torch.float32)
 
     for i in range(len(objects)):
         mask = objects[i]['mask'] > 0
         idx_mask[mask] = objects[i]['idx']
-        feature_mask[mask] = torch.tensor(color_book[objects[i]['idx']], dtype=torch.float32)
+        # % len(color_book): idx cresce senza limite (un idx per ogni oggetto
+        # mai visto, frammenti inclusi), color_book ha lunghezza fissa
+        # (scannet200.txt, 201 righe). Oltre quella soglia l'accesso diretto
+        # va in IndexError e fa morire l'intera run (visto in produzione,
+        # 00824_live_0: crash deterministico appena idx supera 199-200). E'
+        # solo il colore per il viewer, riciclarli non altera la logica di
+        # matching/merge -- non ha significato semantico oltre l'estetica.
+        feature_mask[mask] = torch.tensor(color_book[objects[i]['idx'] % len(color_book)], dtype=torch.float32)
         objects[i]['visibility'] = objects[i]['mask_area'] / (color.shape[0] * color.shape[1])
         objects[i]['best_view'] = 0
         # debug   
@@ -559,7 +584,23 @@ def process_tag_classes(text_prompt:str) -> list[str]:
     classes = text_prompt.split('.')
     classes = [obj_class.strip() for obj_class in classes]
     classes = [obj_class for obj_class in classes if obj_class != '']
-    add_classes = ["picture","handle", 'Bottled Coke', 'Canned Beer', 'apple', 'potato', 'green toy', 'blue bottle', 'green container', 'blue and grey umbrella', 'blue toy', 'pen', 'orange', 'eggplant', 'yellow bottle', 'corn', 'chili pepper', 'small scissors', 'keys', 'green container', 'cabinet', 'long table', 'big table', 'plate']
+    # Lista originale degli autori (Coke, potato, eggplant, umbrella...):
+    # nomi generici di un'altra scena, non della nostra. Su oggetti YCB
+    # reali forzava GroundingDINO verso quei nomi anche quando l'oggetto era
+    # tutt'altro (verificato: un cubo YCB verde etichettato "blue bottle"
+    # solo perche' quel nome era nella lista). Sostituita con i 10 oggetti
+    # YCB davvero usati nello script scena 824
+    # (FOUND-Dataset/scripts/generated/household_experiments_scene_824.json,
+    # campo "template"): 004_sugar_box, 009_gelatin_box, 011_banana,
+    # 024_bowl, 026_sponge, 031_spoon, 036_wood_block, 048_hammer,
+    # 051_large_clamp, 077_rubiks_cube. "picture"/"handle" della lista
+    # originale restano: sono nomi generici plausibili per l'ambiente
+    # domestico attorno agli oggetti, non specifici di un'altra scena.
+    add_classes = [
+        "picture", "handle",
+        "banana", "sugar box", "cardboard box", "bowl", "sponge",
+        "spoon", "wood block", "hammer", "clamp", "rubiks cube", "puzzle cube",
+    ]
     remove_classes = [
         "room", "kitchen", "office", "house", "home", "building", "corner",
         "shadow", "carpet", "photo", "shade", "stall", "space", "aquarium", 
@@ -592,6 +633,17 @@ def process_this_frame_detection(
     detections = DetectionList()
     image = image.cpu().numpy().astype(np.uint8)
 
+    # Tensore vuoto di default: nel ramo GroundingDINO sotto, xyxy_tensor
+    # viene assegnato SOLO se detections_gd.class_id ha almeno un elemento
+    # (riga "if len(detections_gd.class_id) > 0"). Un frame senza detection
+    # valide (GroundingDINO non trova nulla, o tutte le class_id sono -1 e
+    # vengono filtrate) altrimenti arriva al controllo "xyxy_tensor.numel()"
+    # piu' sotto con la variabile mai definita -> UnboundLocalError, visto
+    # in produzione sulla sequenza 829 al frame 144. shape (0, 4): stessa
+    # forma di un tensore xyxy vero con zero box, cosi' .numel()==0 e il
+    # ramo "else: return detections" sotto prende il controllo correttamente.
+    xyxy_tensor = torch.empty((0, 4), device="cuda:0")
+
     if cfg['detection_model'] == 'groundingdino':
         # img_url = encode_img(image)  # Encode the first image to Base64 format
         # completion = ai_client.chat.completions.create(
@@ -615,34 +667,43 @@ def process_this_frame_detection(
         ram_model.eval()
         text_prompt = inference(raw_image, ram_model)[0].replace(' | ', '.')
         classes = process_tag_classes(text_prompt=text_prompt)
+        # detection_class_ids (sotto) indicizza QUESTA lista (i tag RAM di
+        # questo frame, es. "banana, bowl, spoon..."), non
+        # obj_classes.get_classes_arr() (i 199 nomi fissi di ScanNet200).
+        # detection_vocab tiene traccia del vocabolario vero usato per la
+        # detection: va passato piu' sotto in "classes", altrimenti
+        # filter_gobs() risolve il nome indicizzando un elenco diverso da
+        # quello usato per trovare l'oggetto, con un'etichetta risultante
+        # presa a caso da ScanNet200 (es. "wardrobe" per una banana vera).
+        detection_vocab = classes
 
-        detections_gd = detection_model.predict_with_classes(    
+        detections_gd = detection_model.predict_with_classes(
                 image=cv2.cvtColor(image, cv2.COLOR_RGB2BGR), # This function expects a BGR image...
                 classes=classes,
                 box_threshold=0.3,
                 text_threshold=0.3
             )
-        
+
         if len(detections_gd.class_id) > 0:
             ### Non-maximum suppression ###
             print(f"Before NMS: {len(detections_gd.xyxy)} boxes")
             nms_idx = ops.nms(
-                torch.from_numpy(detections_gd.xyxy), 
-                torch.from_numpy(detections_gd.confidence), 
+                torch.from_numpy(detections_gd.xyxy),
+                torch.from_numpy(detections_gd.confidence),
                 0.5
             ).numpy().tolist()
             print(f"After NMS: {len(detections_gd.xyxy)} boxes")
             detections_gd.xyxy = detections_gd.xyxy[nms_idx]
             detections_gd.confidence = detections_gd.confidence[nms_idx]
             detections_gd.class_id = detections_gd.class_id[nms_idx]
-            
+
             # Somehow some detections will have class_id=-1, remove them
             # valid_idx = detections.class_id != -1
             valid_idx = [i for i, val in enumerate(detections_gd.class_id) if (val is not None and val != -1)]
             detections_gd.xyxy = detections_gd.xyxy[valid_idx]
             detections_gd.confidence = detections_gd.confidence[valid_idx]
             detections_gd.class_id = detections_gd.class_id[valid_idx]
-            
+
             confidences = detections_gd.confidence
             detection_class_ids = detections_gd.class_id.astype(int)
             xyxy_np = detections_gd.xyxy
@@ -654,11 +715,28 @@ def process_this_frame_detection(
         detection_class_labels = [f"{obj_classes.get_classes_arr()[class_id]} {class_idx}" for class_idx, class_id in enumerate(detection_class_ids)]
         xyxy_tensor = results[0].boxes.xyxy
         xyxy_np = xyxy_tensor.cpu().numpy()
+        # Ramo YOLO: qui detection_class_ids indicizza davvero
+        # obj_classes.get_classes_arr() (detection_model.set_classes(...) e'
+        # stato inizializzato con quello stesso elenco), quindi qui e'
+        # corretto e resta il vocabolario da passare in "classes".
+        detection_vocab = obj_classes.get_classes_arr()
 
     if xyxy_tensor.numel() != 0:
-        sam_out = sam_predictor.predict(image, bboxes=xyxy_tensor, verbose=False)
-        masks_tensor = sam_out[0].masks.data
-        masks_np = masks_tensor.cpu().numpy()
+        try:
+            sam_out = sam_predictor.predict(image, bboxes=xyxy_tensor, verbose=False)
+            masks_tensor = sam_out[0].masks.data
+            masks_np = masks_tensor.cpu().numpy()
+        except torch.OutOfMemoryError:
+            # Visto in produzione il 2026-09-12 17:14 (frame 158, run
+            # 00824_live_0): l'OOM ha ucciso l'intero processo e con esso
+            # tutti i frame successivi (spawn/move/remove mai avvenuti).
+            # Un frame saltato con la GPU liberata e' una run degradata,
+            # non una run morta -- molto piu' utile per il confronto con
+            # la ground truth.
+            print(f"[process_this_frame_detection] CUDA OOM al frame {time_idx}: "
+                  f"frame saltato, nessuna detection prodotta")
+            torch.cuda.empty_cache()
+            return detections
     else:
         return detections
 
@@ -669,19 +747,19 @@ def process_this_frame_detection(
         class_id=detection_class_ids,  # np
         mask=masks_np,
     )
-    
+
     image_crops, image_feats, text_feats = compute_clip_features_batched(
-                                                image, curr_det, 
-                                                clip_model, clip_preprocess, clip_tokenizer, 
+                                                image, curr_det,
+                                                clip_model, clip_preprocess, clip_tokenizer,
                                                 obj_classes.get_classes_arr(), device='cuda')
-    
+
     results = {
-        # add new uuid for each detection 
+        # add new uuid for each detection
         "xyxy": curr_det.xyxy,
         "confidence": curr_det.confidence,
         "class_id": curr_det.class_id,
         "mask": curr_det.mask,
-        "classes": obj_classes.get_classes_arr(),
+        "classes": detection_vocab,
         "image_crops": image_crops,
         "image_feats": image_feats,
         "text_feats": text_feats,
@@ -707,9 +785,23 @@ def process_this_frame_detection(
         num_labels, _ = cv2.connectedComponents(filtered_gobs['mask'][idx].astype(np.uint8), connectivity=4)
         if mask_area > 500 and (num_labels - 1) < 5 :
             filtered_gobs['mask'][idx] = binary_erosion(filtered_gobs['mask'][idx], structure=np.ones((3, 3)))
+            local_class_id = filtered_gobs['class_id'][idx]
+            # Risolto qui, subito, col vocabolario giusto (detection_vocab:
+            # i tag RAM di questo frame, non ScanNet200) e portato avanti
+            # come stringa. class_id da solo non basta piu' in avanti: e'
+            # un indice nel vocabolario di QUESTO frame, che il resto della
+            # pipeline (log_graph_state, live_viewer) non ha e non puo'
+            # ricostruire -- ripassargli obj_classes.get_classes_arr() (come
+            # succedeva prima) fa lo stesso errore di indicizzare l'elenco
+            # sbagliato che si stava correggendo qui sopra.
+            try:
+                class_name = str(detection_vocab[int(local_class_id)])
+            except (ValueError, IndexError, TypeError):
+                class_name = None
             detection = {
                 'idx' : idx + 1,
-                'class_id' : [filtered_gobs['class_id'][idx]],
+                'class_id' : [local_class_id],
+                'class_name' : class_name,
                 'mask' : filtered_gobs['mask'][idx],
                 'mask_area' : filtered_gobs['mask'][idx].sum(),
                 'clip_ft' : filtered_gobs['image_feats'][idx],
@@ -718,7 +810,7 @@ def process_this_frame_detection(
                 'best_view' : time_idx
             }
             detections.append(detection)
-    
+
     if len(detections) > 0:
         detections = merge_curr_detection_itself(detections, cfg)
 
@@ -793,21 +885,61 @@ def render_curr_frame_with_idx(params: dict,
             select_rendervar = transformed_params_for_detection(select_params, transformed_select_gaussians)
             rasterizer = Renderer(raster_settings=curr_data['cam'])
             object_mask, _, _, = rasterizer(**select_rendervar)
-            
-            bool_mask = (object_mask != 0).any(dim=0).cpu().numpy()
+
+            # Versione torch della maschera, tenuta su GPU: serve a indicizzare
+            # object_mask qui sotto senza trasferire l'intera immagine full-res
+            # sulla CPU. bool_mask (numpy) resta invariata per il chiamante.
+            bool_mask_t = (object_mask != 0).any(dim=0)
+            bool_mask = bool_mask_t.cpu().numpy()
             mask_pixel_count = bool_mask.sum().item()
 
+            if mask_pixel_count == 0 and os.environ.get("DGSG_DEBUG_RENDER"):
+                # Diagnostica temporanea (attiva solo con DGSG_DEBUG_RENDER=1):
+                # distingue "nessuna gaussiana selezionata" (problema di
+                # object_idx) da "gaussiane presenti ma non rasterizzate"
+                # (problema di posa/opacita'/frustum).
+                n_sel = select_params['means3D'].shape[0]
+                n_frust = int(in_frustum.sum()) if in_frustum is not None else -1
+                opac = select_params['logit_opacities']
+                print(f"[DBG] idx={map_object['idx']} n_gauss={n_sel} "
+                      f"in_frustum={n_frust} "
+                      f"opac_min={float(opac.min()) if n_sel else 'n/a'} "
+                      f"opac_max={float(opac.max()) if n_sel else 'n/a'}", flush=True)
+
             if mask_pixel_count > 200:
+                # CAUSA DI OOM RISOLTA QUI. Prima si salvava 'color_mask':
+                # object_mask, cioe' il tensore FULL-RES della rasterizzazione,
+                # TRATTENUTO SU GPU per ogni oggetto sopravvissuto. Con 115
+                # oggetti mappati significa 115 immagini complete vive
+                # contemporaneamente: misurato, 14.5 GiB di VRAM esauriti al
+                # frame 258 (l'istante esatto in cui frame_begin_update accende
+                # questo controllo), mentre i parametri gaussiani occupavano
+                # appena 0.066 GB. Il torch.no_grad() sopra evita il grafo di
+                # autograd, ma non libera i tensori trattenuti in questa lista.
+                #
+                # I due unici consumatori (check_update, righe ~1291 e ~1312)
+                # riducono comunque subito a CPU/numpy: uno indicizza con la
+                # maschera per la SSIM, l'altro moltiplica per la maschera solo
+                # per il viewer. Nessuno ha bisogno del tensore full-res su
+                # device dopo il render, quindi qui si conserva solo cio' che
+                # serve davvero, gia' su CPU:
+                #   masked_rgb -> i pixel dentro la maschera, per la SSIM
+                #   vis_expected -> l'immagine mascherata per il viewer
+                # Il picco di memoria diventa quello di UN oggetto alla volta.
+                masked_rgb = object_mask[:, bool_mask_t].detach().cpu().numpy()
+                vis_expected = (object_mask * bool_mask_t).permute(1, 2, 0).detach().cpu().numpy()
                 map_object = {
                     'idx' : map_object['idx'],
                     'mask' : bool_mask,
                     'mask_area' : mask_pixel_count,
-                    'color_mask' : object_mask,
+                    'masked_rgb' : masked_rgb,
+                    'vis_expected' : vis_expected,
                     'clip_ft' : map_object['clip_ft'],
                     'num_detections' : map_object['num_detections'],
                     'in_frustum' : in_frustum
                 }
                 curr_frame_objects.append(map_object)
+                del object_mask, select_rendervar, transformed_select_gaussians, select_params, rasterizer
             else:
                 print(f"Skipping object {map_object['idx']} due to low number of pixs({mask_pixel_count}) after splatting in current camera view")
                 continue
@@ -1015,6 +1147,12 @@ def merge_obj2_into_obj1(obj1: dict, obj2: dict):
     merged_obj = {
         'idx' : obj1['idx'],
         'class_id' : obj1['class_id'],
+        # class_name gia' risolto col vocabolario giusto in
+        # process_this_frame_detection: preservato qui, altrimenti i merge
+        # successivi lo perdono (il dict e' ricostruito da zero) e
+        # log_graph_state/live_viewer tornano a risolvere il nome da soli
+        # con obj_classes.get_classes_arr(), riproducendo lo stesso bug.
+        'class_name' : obj1.get('class_name'),
         'mask' : obj1['mask'] | obj2['mask'],
         'mask_area' : (obj1['mask'] | obj2['mask']).sum(),
         'clip_ft' : (obj1['clip_ft'] * obj1['num_detections'] + obj2['clip_ft'] * obj2['num_detections']) / (obj1['num_detections'] + obj2['num_detections']),
@@ -1032,16 +1170,23 @@ def merge_obj2_into_obj1_for_merge(obj1: dict, obj2: dict):
         mask_area_to_keep = obj1['mask_area']
         best_view_to_keep = obj1['best_view']
         image_crops_to_keep = obj1['image_crops']
+        class_name_to_keep = obj1.get('class_name')
     else:
         mask_to_keep = obj2['mask']
         mask_area_to_keep = obj2['mask_area']
         best_view_to_keep = obj2['best_view']
         image_crops_to_keep = obj2['image_crops']
+        class_name_to_keep = obj2.get('class_name')
 
     obj1['class_id'].extend(obj2['class_id'])
     merged_obj = {
         'idx' : obj1['idx'],
         'class_id' : obj1['class_id'],
+        # vedi il commento equivalente in merge_obj2_into_obj1: senza
+        # questo il nome torna a essere risolto altrove con l'elenco
+        # sbagliato (ScanNet200 invece dei tag RAM del frame in cui
+        # l'oggetto e' stato trovato).
+        'class_name' : class_name_to_keep,
         'mask' : mask_to_keep,
         'mask_area' : mask_area_to_keep,
         'clip_ft' : (obj1['clip_ft'] * obj1['num_detections'] + obj2['clip_ft'] * obj2['num_detections']) / (obj1['num_detections'] + obj2['num_detections']),
@@ -1150,7 +1295,9 @@ def compute_similarities_and_merge(detections: DetectionList,
         curr_objects_idx = []
         new_objects_idx = []
         privilege_object = []
-        curr_idx_mask = np.zeros((H, W), dtype=np.int8) 
+        # int32: vedi il commento su idx_mask in
+        # initialize_first_timestep_gaussian_classes (stesso overflow).
+        curr_idx_mask = np.zeros((H, W), dtype=np.int32)
         curr_features_mask = torch.zeros((H, W, 3), dtype=torch.float32)
 
         return curr_idx_mask, curr_features_mask, objects, curr_objects_idx, new_objects_idx, privilege_object
@@ -1176,13 +1323,21 @@ def compute_similarities_and_merge(detections: DetectionList,
             new_objects_idx.append(detections[detected_obj_idx]['idx'])
 
 
-    curr_idx_mask = np.zeros((detections[0]['mask'].shape[0], detections[0]['mask'].shape[1]), dtype=np.int8) 
+    # int32: e' QUESTA la maschera che porta gli idx alle gaussiane nuove
+    # (add_new_gaussians la legge per assegnare object_idx), quindi era il
+    # punto in cui l'overflow int8 faceva piu' danno. Vedi il commento su
+    # idx_mask in initialize_first_timestep_gaussian_classes.
+    curr_idx_mask = np.zeros((detections[0]['mask'].shape[0], detections[0]['mask'].shape[1]), dtype=np.int32)
     curr_features_mask = torch.zeros((detections[0]['mask'].shape[0], detections[0]['mask'].shape[1], 3), dtype=torch.float32)
     curr_objects_idx = []
     for detected_obj_idx, existing_obj_match_idx in enumerate(match_indices):
         mask = detections[detected_obj_idx]['mask'] > 0
         curr_idx_mask[mask] = objects[existing_obj_match_idx]['idx']
-        curr_features_mask[mask] = torch.tensor(color_book[objects[existing_obj_match_idx]['idx']], dtype=torch.float32)
+        # Stesso wraparound di feature_mask sopra: idx puo' superare la
+        # lunghezza fissa di color_book (era il crash reale della run
+        # 00824_live_0, IndexError qui a idx~200).
+        curr_features_mask[mask] = torch.tensor(
+            color_book[objects[existing_obj_match_idx]['idx'] % len(color_book)], dtype=torch.float32)
         curr_objects_idx.append(objects[existing_obj_match_idx]['idx'])
         # # debug
         # plt.subplot(1, 2, 1) 
@@ -1209,7 +1364,13 @@ def check_update(color, depth, curr_cam_mapobjects, detections=None, cfg=None):
     objects_to_remove = []
     for i, curr_obj in enumerate(curr_cam_mapobjects):
         mask = torch.from_numpy(curr_obj['mask']).cuda()
-        weighted_im = curr_obj['color_mask'][:,mask].cpu().numpy()  
+        # 'masked_rgb' arriva gia' ridotto ai soli pixel dentro la maschera e
+        # gia' su CPU (vedi render_curr_frame_with_idx): prima qui si
+        # indicizzava 'color_mask', il tensore full-res trattenuto su GPU per
+        # OGNI oggetto, che con 115 oggetti esauriva la VRAM. Il valore
+        # numerico passato alla SSIM e' identico, cambia solo dove e quando
+        # viene ritagliato.
+        weighted_im = curr_obj['masked_rgb']
         weighted_gt_im = color[:,mask].cpu().numpy()
         
         ssim_scores = 0
@@ -1230,11 +1391,14 @@ def check_update(color, depth, curr_cam_mapobjects, detections=None, cfg=None):
 
         # Confronto mappa attesa / vista reale: e' il segnale su cui si decide
         # la rimozione. plt.show() bloccherebbe la pipeline a ogni oggetto.
-        vis1 = curr_obj['color_mask'] * mask
+        # 'vis_expected' e' gia' l'immagine mascherata in formato HWC su CPU
+        # (prodotta in render_curr_frame_with_idx), che e' esattamente cio' che
+        # show_change si aspetta: prima veniva ricalcolata qui da 'color_mask',
+        # il tensore full-res trattenuto su GPU per ogni oggetto.
         vis2 = color * mask
         from utils import live_viewer
         live_viewer.show_change(
-            vis1.permute(1, 2, 0).detach().cpu().numpy(),
+            curr_obj['vis_expected'],
             vis2.permute(1, 2, 0).detach().cpu().numpy(),
             curr_obj['idx'], float(ssim_scores),
         )
@@ -1296,12 +1460,38 @@ def get_curr_objects_pcd(depth, idx_mask, curr_objects_idx, intrinsics, w2c, tra
     return curr_objects_pcd
 
 
+_faiss_gpu_res = None  # creato una sola volta al primo uso, mai ricreato
+
+
+def _new_flat_l2_index(dim: int):
+    """Stesso identico indice esatto (nearest-neighbor L2, nessuna
+    approssimazione), spostato su GPU se disponibile. index.search()
+    dopo la creazione resta identico a prima: stessa chiamata, stessa
+    semantica, stesso risultato -- solo il calcolo gira su GPU invece
+    che CPU. Verificato con benchmark (concordanza 100% CPU vs GPU su
+    fino a 1.8M punti). Il primo utilizzo assoluto paga un warm-up CUDA
+    una tantum (centinaia di ms, trascurabile su un run di ore); tutte
+    le chiamate successive restano sui pochi millisecondi misurati.
+    Ripiega silenziosamente su CPU se la GPU non e' disponibile.
+    """
+    global _faiss_gpu_res
+    index = faiss.IndexFlatL2(dim)
+    if faiss.get_num_gpus() > 0:
+        try:
+            if _faiss_gpu_res is None:
+                _faiss_gpu_res = faiss.StandardGpuResources()
+            index = faiss.index_cpu_to_gpu(_faiss_gpu_res, 0, index)
+        except Exception:
+            pass  # GPU non utilizzabile per qualche motivo: resta l'indice CPU gia' creato sopra
+    return index
+
+
 def update_curr_objects_gaussians(params : dict, objects: MapObjectList,
                                   curr_objects_pcd, new_objects_idx, privilege_object_tuple, cfg, time_idx):
 
     scene_pcd_np = params['means3D'].detach().cpu().numpy()
 
-    index = faiss.IndexFlatL2(3)
+    index = _new_flat_l2_index(3)
     index.add(scene_pcd_np)
 
     privilege_object = [obj[0] for obj in privilege_object_tuple]
@@ -1391,6 +1581,34 @@ def save_objects(params, objects: MapObjectList, dataset, ai_client, lf_config, 
     prompt_modes = {
             "focal_prompt": "full+focal_crop",
         }
+    # CAUSA REALE DEGLI OOM (individuata dal traceback: riga 1064 di
+    # dynamic_gsg_real_ssim.py -> qui -> vision_tower.to(cuda)).
+    # DAM-3B viene caricato su cuda:0 mentre GroundingDINO, SAM, RAM, CLIP e
+    # le gaussiane sono GIA' residenti: sono quei ~12.4 GiB che saturavano
+    # una GPU da 15.47 GiB. Il crash cadeva sempre a frame_begin_update
+    # perche' e' li' che il loop chiama save_objects la prima volta -- non
+    # per il numero di gaussiane, che nel test erano stabili a ~150k e
+    # addirittura in calo (il pruning funzionava gia').
+    # Si libera la cache prima del caricamento per dare a DAM tutto lo
+    # spazio realmente disponibile.
+    torch.cuda.empty_cache()
+    # DAM-3B produce SOLO obj['description'] e una riscrittura di
+    # obj['category'] via LLM. Il grafo (log_graph_state) scrive idx,
+    # category, centroid e clip_ft indipendentemente da qui, e sono gli
+    # unici campi che il confronto con la ground truth legge: le didascalie
+    # non entrano in nessuna metrica. Con use_dam=False si salta il
+    # caricamento e gli oggetti mantengono la category del detector.
+    if not lf_config.get('use_dam', True):
+        print("[save_objects] use_dam=False: salto DAM-3B (didascalie non "
+              "necessarie alle metriche), gli oggetti tengono la category del detector")
+        objects_serial = objects.to_serializable()
+        objects_save_path = Path(output_dir) / "objects.pkl.gz"
+        objects_save_path.parent.mkdir(parents=True, exist_ok=True)
+        with gzip.open(objects_save_path, "wb") as f:
+            pickle.dump(objects_serial, f)
+        print(f"Saving map objects to: {objects_save_path}")
+        return
+
     dam_model = DescribeAnythingModel(
         model_path=lf_config['dam_model_path'],
         conv_mode=lf_config['dam_conv_mode'],
@@ -1467,6 +1685,16 @@ def save_objects(params, objects: MapObjectList, dataset, ai_client, lf_config, 
         pickle.dump(objects, f)
 
     print(f"Saving map objects to: {objects_save_path}")
+
+    # DAM-3B va rilasciato appena finito di usarlo: senza questo il modello
+    # resta residente su cuda:0 per il resto della run. save_objects viene
+    # chiamata DUE volte (riga 1064 dentro il loop, al passaggio di
+    # frame_begin_update, e riga 1356 a fine run): senza rilascio la prima
+    # chiamata lascia occupati diversi GB e la seconda trova la GPU gia'
+    # piena. E' quello che produceva l'OOM anche con appena 16 oggetti
+    # mappati e ~150k gaussiane.
+    del dam_model
+    torch.cuda.empty_cache()
 
 
 def load_data(file_path: Path) -> list:

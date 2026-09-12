@@ -47,7 +47,15 @@ def _as_uint8_rgb(image):
 
 
 def _iter_detections(detections, classes=None):
-    """Normalizza i due formati: DetectionList (lista di dict) o dict di array."""
+    """Normalizza i due formati: DetectionList (lista di dict) o dict di array.
+
+    class_name (nel caso lista di dict) e' gia' risolto in
+    process_this_frame_detection col vocabolario giusto -- i tag RAM del
+    frame per GroundingDINO, non i 199 nomi fissi di ScanNet200 -- e va
+    preferito. Il fallback su classes[cid] resta solo per il formato dict
+    legacy (nessun class_name per-detection li') e per detection che ne
+    fossero prive.
+    """
     if not detections:
         return []
     items = []
@@ -65,7 +73,9 @@ def _iter_detections(detections, classes=None):
                 continue
             raw = det.get("class_id")
             cid = int(raw[0]) if isinstance(raw, (list, tuple, np.ndarray)) and len(raw) else i
-            name = str(classes[cid]) if classes is not None and cid < len(classes) else None
+            name = det.get("class_name")
+            if not name:
+                name = str(classes[cid]) if classes is not None and cid < len(classes) else None
             items.append((mask, cid, name))
     return items
 
@@ -108,11 +118,30 @@ def _draw_camera_panel(rgb, detections, height, classes=None):
 
 
 def _object_label(obj, classes=None):
-    """Nome leggibile: categoria gia' assegnata, altrimenti classe YOLO/RAM
-    grezza, mai un idx nudo."""
+    """Nome leggibile: categoria gia' assegnata, altrimenti class_name gia'
+    risolto dalla detection, altrimenti (solo fallback legacy) classe
+    grezza indicizzata in 'classes', mai un idx nudo.
+
+    Il salto diretto a classes[class_id] (senza passare da class_name) e'
+    il bug osservato in produzione: class_id e' un indice nel vocabolario
+    RAM/GroundingDINO DI QUEL FRAME (vedi detection_vocab in
+    process_this_frame_detection, map_objects_utils_up_with_groupv3.py),
+    mentre 'classes' qui e' quasi sempre obj_classes.get_classes_arr(),
+    cioe' i 199 nomi fissi di ScanNet200 -- un vocabolario diverso da
+    quello che class_id indicizza davvero. Un oggetto appena creato (senza
+    ancora 'category') con class_id piccolo finiva quindi rietichettato
+    con qualunque nome stia in quella posizione in ScanNet200 ("bag" e'
+    alla posizione 3): non e' una detection, e' un indice letto nella
+    lista sbagliata. class_name e' gia' risolto correttamente per-oggetto
+    in process_this_frame_detection (vedi il suo stesso identico fix,
+    commentato li') e va sempre preferito quando c'e'.
+    """
     category = obj.get('category')
     if category:
         return str(category)
+    class_name = obj.get('class_name')
+    if class_name:
+        return str(class_name)
     class_id = obj.get('class_id')
     if isinstance(class_id, (list, tuple, np.ndarray)) and len(class_id):
         class_id = class_id[0]
@@ -206,6 +235,28 @@ def show_change(expected, observed, obj_idx, ssim_score):
         left = cv2.resize(left, (int(left.shape[1] * h / left.shape[0]), h))
         right = cv2.resize(right, (int(right.shape[1] * h / right.shape[0]), h))
 
+        # "atteso" e "osservato" arrivano con aspect ratio diverso (il primo
+        # e' spesso un ritaglio stretto attorno al solo oggetto, il secondo
+        # il frame intero della camera): scalarli solo alla stessa altezza,
+        # come sopra, lascia ognuno alla propria larghezza naturale -- il
+        # riquadro piu' stretto finisce addossato al bordo dell'hstack
+        # invece che centrato sotto la sua etichetta, quindi il confronto
+        # visivo (dov'e' l'oggetto in un pannello rispetto all'altro) si
+        # rompe ogni volta che le due larghezze non coincidono per caso.
+        # Si compone invece su una tela comune, ogni pannello centrato nella
+        # sua meta': l'inquadratura resta centrata indipendentemente da
+        # quanto sono state ridotte le immagini in ingresso.
+        panel_w = max(left.shape[1], right.shape[1])
+        canvas_w = panel_w * 2
+
+        def _center_on(img, width):
+            canvas = np.full((h, width, 3), _BG, dtype=np.uint8)
+            x0 = (width - img.shape[1]) // 2
+            canvas[:, x0:x0 + img.shape[1]] = img
+            return canvas
+
+        left = _center_on(left, panel_w)
+        right = _center_on(right, panel_w)
         pair = np.hstack([left, right])
         header = np.full((44, pair.shape[1], 3), _BG, dtype=np.uint8)
         moved = ssim_score < 0.15
@@ -219,7 +270,10 @@ def show_change(expected, observed, obj_idx, ssim_score):
         labels = np.full((26, pair.shape[1], 3), _BG, dtype=np.uint8)
         cv2.putText(labels, "atteso dalla mappa", (12, 18),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.4, _MUTED, 1, cv2.LINE_AA)
-        cv2.putText(labels, "visto dalla camera", (left.shape[1] + 12, 18),
+        # panel_w, non left.shape[1]: dopo la centratura ogni pannello
+        # occupa esattamente meta' della tela, a prescindere dalla
+        # larghezza naturale delle due immagini in ingresso.
+        cv2.putText(labels, "visto dalla camera", (panel_w + 12, 18),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.4, _MUTED, 1, cv2.LINE_AA)
 
         cv2.imshow("DynamicGSG - verifica cambiamento",
