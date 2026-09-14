@@ -879,8 +879,28 @@ def render_curr_frame_with_idx(params: dict,
         for map_object in tqdm(objects):
 
             select_params = select_idx_gaussian(params, map_object['idx'], color_book, if_first_frame)
+
+            # Un oggetto senza gaussiane assegnate (mai risolto dal matching
+            # cross-frame: la maggior parte dei nodi-fantasma nella scena 824,
+            # 391 su 392 misurati) non puo' produrre altro che una maschera a
+            # 0 pixel -- trasformare, rasterizzare e poi scoprirlo era lavoro
+            # sprecato ripetuto per ogni oggetto a ogni frame. Con centinaia
+            # di nodi-fantasma il loop (tqdm sopra: ~85 it/s) da solo costava
+            # secondi per frame, ripetuto piu' volte a frame (tracking +
+            # mapping): misurato, la pipeline era scesa a ~1 frame ogni 15s
+            # con 380+ oggetti in grafo. Il salto qui non cambia l'esito
+            # (l'oggetto finiva comunque escluso dal pool di confronto),
+            # elimina solo il lavoro GPU per arrivarci.
+            if select_params['means3D'].shape[0] == 0:
+                if os.environ.get("DGSG_DEBUG_RENDER"):
+                    print(f"[DBG] idx={map_object['idx']} n_gauss=0 "
+                          f"(saltato senza rasterizzare)", flush=True)
+                print(f"Skipping object {map_object['idx']} due to low number of pixs(0) after splatting in current camera view")
+                del select_params
+                continue
+
             transformed_select_gaussians = transform_to_frame(select_params, time_idx, gaussians_grad=False, camera_grad=False)
-            in_frustum = points_in_frustum(transformed_select_gaussians['means3D'], curr_data['intrinsics'], 
+            in_frustum = points_in_frustum(transformed_select_gaussians['means3D'], curr_data['intrinsics'],
                                            curr_data['cam'].image_width, curr_data['cam'].image_height, 0.1, 100)
             select_rendervar = transformed_params_for_detection(select_params, transformed_select_gaussians)
             rasterizer = Renderer(raster_settings=curr_data['cam'])
@@ -939,11 +959,23 @@ def render_curr_frame_with_idx(params: dict,
                     'in_frustum' : in_frustum
                 }
                 curr_frame_objects.append(map_object)
-                del object_mask, select_rendervar, transformed_select_gaussians, select_params, rasterizer
             else:
                 print(f"Skipping object {map_object['idx']} due to low number of pixs({mask_pixel_count}) after splatting in current camera view")
-                continue
-    
+
+            # Il del DEVE stare fuori dall'if/else: prima era solo nel ramo
+            # "if" e il ramo "else" faceva un continue nudo, quindi ogni
+            # oggetto SCARTATO lasciava vivo un object_mask full-res
+            # (3x480x640 float32 = 3.52 MB). E' il ramo che scatta per la
+            # quasi totalita' degli oggetti quando il grafo si riempie di
+            # nodi-fantasma a 0 pixel: misurato sulla run del 2026-09-12
+            # 19:22, 57.329 skip totali e 258 oggetti per frame, cioe' 0.89
+            # GB per frame che finivano nella cache di PyTorch senza mai
+            # tornare a CUDA. La pipeline moriva ~159 frame dopo, non con un
+            # OutOfMemoryError di torch (il suo pool aveva ancora spazio) ma
+            # dentro FAISS, che usa cudaMalloc diretto fuori dal pool PyTorch
+            # e non trovava piu' nemmeno i 32 MB del suo indice.
+            del object_mask, bool_mask_t, select_rendervar, transformed_select_gaussians, select_params, rasterizer
+
     return curr_frame_objects
 
 
@@ -1491,8 +1523,31 @@ def update_curr_objects_gaussians(params : dict, objects: MapObjectList,
 
     scene_pcd_np = params['means3D'].detach().cpu().numpy()
 
+    # PyTorch e FAISS hanno allocatori CUDA SEPARATI: quello che PyTorch
+    # tiene nella sua cache risulta occupato per FAISS, che alloca con
+    # cudaMalloc diretto. Qui siamo a meta' frame, subito dopo che
+    # render_curr_frame_with_idx ha rasterizzato tutti gli oggetti del
+    # grafo, quindi nel punto di massima occupazione; l'empty_cache() del
+    # loop principale (dynamic_gsg_real_ssim.py) arriva solo a fine frame,
+    # troppo tardi per questa chiamata. Restituire qui la cache a CUDA e'
+    # cio' che permette a index.add() di trovare spazio.
+    torch.cuda.empty_cache()
+
     index = _new_flat_l2_index(3)
-    index.add(scene_pcd_np)
+    try:
+        index.add(scene_pcd_np)
+    except RuntimeError as exc:
+        # Rete di sicurezza: un OOM qui uccideva l'INTERO processo (visto il
+        # 2026-09-12 al frame 429, "StandardGpuResources: alloc fail"), e con
+        # esso tutti i frame successivi. L'indice CPU da' lo stesso identico
+        # risultato -- e' un IndexFlatL2 esatto in entrambi i casi, cambia
+        # solo dove gira il calcolo -- quindi una run piu' lenta e' sempre
+        # preferibile a una run morta.
+        print(f"[update_curr_objects_gaussians] indice GPU non allocabile "
+              f"({exc}); ripiego su CPU per questo frame")
+        torch.cuda.empty_cache()
+        index = faiss.IndexFlatL2(3)
+        index.add(scene_pcd_np)
 
     privilege_object = [obj[0] for obj in privilege_object_tuple]
 
@@ -1501,22 +1556,104 @@ def update_curr_objects_gaussians(params : dict, objects: MapObjectList,
         object_idx = curr_objects_pcd[i]['idx']
         object_pcd_np = curr_objects_pcd[i]['points']
 
-        _, indices = index.search(object_pcd_np, 1)
+        # La distanza NON va scartata (era "_, indices"): index.search
+        # restituisce sempre il vicino piu' prossimo, anche se sta a mezzo
+        # metro, quindi senza questo dato il criterio diventa "vicinanza
+        # relativa" invece di "vicinanza assoluta". Un oggetto spawnato su un
+        # tavolo gia' ricostruito trova come "piu' vicine" le gaussiane DEL
+        # TAVOLO, gia' di proprieta': ratio bassissime (0.06-0.14 misurate) e
+        # oggetto scartato, che e' l'origine della spirale dei duplicati.
+        sq_dists, indices = index.search(object_pcd_np, 1)
 
         indices = indices.flatten()
-        
-        print(f"update gs num before: {indices.shape[0]}")
+        dists = np.sqrt(sq_dists.flatten())  # faiss L2 restituisce la distanza AL QUADRATO
 
-        update_positions = ((params['object_idx'][indices] == 0) | (params['object_idx'][indices] == curr_objects_pcd[i]['idx']))
+        print(f"update gs num before: {indices.shape[0]}")
+        if os.environ.get("DGSG_DEBUG_ADOPT"):
+            # Sonda per tarare DGSG_ADOPT_MAX_DIST_M sui dati reali invece
+            # che a tavolino: mostra quanto sono lontane davvero le gaussiane
+            # che il search assegna, e quante sarebbero tenute a varie soglie.
+            q = np.percentile(dists, [50, 90, 99]) if dists.size else [0, 0, 0]
+            within = {f"{t:.2f}m": int((dists <= t).sum()) for t in (0.02, 0.05, 0.10, 0.20)}
+            print(f"[ADOPT] idx={object_idx} n={dists.size} "
+                  f"d50={q[0]*100:.1f}cm d90={q[1]*100:.1f}cm d99={q[2]*100:.1f}cm "
+                  f"entro={within}", flush=True)
+
+        # Un vicino oltre la soglia non e' "quella gaussiana", e' un'altra
+        # superficie: escluderlo evita che gaussiane lontane e gia' possedute
+        # da altri oggetti finiscano nel denominatore della ratio.
+        max_adopt_dist = float(os.environ.get("DGSG_ADOPT_MAX_DIST_M", "0.05"))
+        near = dists <= max_adopt_dist
+
+        # .flatten() indispensabile: object_idx e' salvato come COLONNA (N,1)
+        # (slice init_pt_cld[:, 9:]), quindi params['object_idx'][indices] ha
+        # forma (N,1); combinarlo con near, che e' (N,), fa broadcasting e
+        # produce una matrice (N,N) invece del vettore atteso -> IndexError
+        # sulla riga di assegnazione sotto.
+        owners = params['object_idx'][indices].reshape(-1)
+        update_positions = ((owners == 0) | (owners == curr_objects_pcd[i]['idx'])) & near
 
         if object_idx in new_objects_idx:
-            if (indices.shape[0] > cfg['update_gs_num_threshold']) and ((np.sum(update_positions) / indices.shape[0]) > cfg['update_gs_ratio_threshold']):
+            # Il denominatore deve essere il numero di punti che HANNO un
+            # vicino entro la soglia, non tutti i punti dell'oggetto: con il
+            # filtro di distanza il numeratore cala, e tenere il vecchio
+            # denominatore (indices.shape[0]) abbasserebbe la ratio invece di
+            # renderla piu' onesta. Cosi' la ratio risponde alla domanda
+            # giusta -- "delle gaussiane davvero MIE, quante sono libere?" --
+            # invece di "quanti dei miei punti hanno per caso un vicino
+            # libero da qualche parte nella scena".
+            n_near = int(np.sum(near))
+            n_free = int(np.sum(update_positions))
+            ratio = (n_free / n_near) if n_near > 0 else 0.0
 
+            if (n_near > cfg['update_gs_num_threshold']) and (ratio > cfg['update_gs_ratio_threshold']):
                 params['object_idx'][indices[update_positions.flatten()]] = object_idx
-                print(f"update new object {object_idx} gs num:{indices.shape[0]} {np.sum(update_positions)}  {(np.sum(update_positions) / indices.shape[0])}")
+                print(f"update new object {object_idx} gs num:{n_near} {n_free}  {ratio}")
             else:
+                # Le gaussiane sono gia' di qualcun altro. Prima questo
+                # produceva sempre un nodo-fantasma (oggetto senza gaussiane,
+                # invisibile al matching, ricreato al frame dopo: l'origine
+                # della valanga di duplicati). Ma se la maggioranza delle
+                # gaussiane appartiene a UN SOLO altro oggetto, non e' una
+                # zona contesa: e' lo STESSO oggetto fisico rilevato due
+                # volte nello stesso frame (misurato sulla scena 824: nodi
+                # diversi che rivendicano esattamente le stesse gaussiane --
+                # 3351, 3348, 900 punti identici in sequenza, il primo vince
+                # con ratio 1.0 e gli altri falliscono). In quel caso la
+                # risposta giusta e' fondere, non duplicare: si marca
+                # l'oggetto come "assorbito" da quello che possiede le
+                # gaussiane, cosi' merge_obj_matches lo unira' invece di
+                # lasciarlo orfano.
+                owners_taken = owners[near & (owners != 0) & (owners != object_idx)]
+                absorbed_by = None
+                if owners_taken.size > 0:
+                    vals, counts = np.unique(owners_taken, return_counts=True)
+                    dominant = int(vals[np.argmax(counts)])
+                    dominant_share = float(counts.max()) / max(n_near, 1)
+                    # Serve una maggioranza netta: se le gaussiane sono
+                    # sparse fra molti proprietari diversi e' davvero una
+                    # zona contesa, non un duplicato dello stesso oggetto.
+                    if dominant_share >= 0.5:
+                        absorbed_by = dominant
+
                 invaild_new_objects_idx.append(object_idx)
-                print(f"invaild_new_object:{indices.shape[0]} {np.sum(update_positions) / indices.shape[0]}")
+                if absorbed_by is not None:
+                    # L'oggetto viene comunque scartato come nodo nuovo (e'
+                    # un doppione), ma le gaussiane ancora LIBERE nella sua
+                    # area vanno all'oggetto che gia' possiede quella
+                    # superficie, invece di restare senza proprietario e
+                    # alimentare il prossimo doppione. Non si tocca
+                    # privilege_object_tuple: quella struttura e' gia' stata
+                    # letta a inizio funzione (privilege_object, sopra) e
+                    # modificarla qui non avrebbe effetto nel ciclo corrente.
+                    free_here = near & (owners == 0)
+                    if np.any(free_here):
+                        params['object_idx'][indices[free_here.flatten()]] = absorbed_by
+                    print(f"absorbed_new_object:{object_idx} into {absorbed_by} "
+                          f"(share {dominant_share:.2f}, n_near {n_near}, "
+                          f"gauss_riassegnate {int(np.sum(free_here))})")
+                else:
+                    print(f"invaild_new_object:{n_near} {ratio}")
         else:
             if object_idx in privilege_object:
                 for obj in privilege_object_tuple:
@@ -1530,6 +1667,12 @@ def update_curr_objects_gaussians(params : dict, objects: MapObjectList,
             else:
                 params['object_idx'][indices[update_positions.flatten()]] = object_idx
                 print(f"updated gs num: {np.sum(update_positions)}")
+
+    # L'indice GPU tiene una copia di TUTTE le gaussiane della scena (32 MB
+    # con 2.8M gaussiane) e viene ricreato a ogni frame: senza il del resta
+    # appeso finche' il garbage collector non passa, sommandosi all'indice
+    # del frame successivo.
+    del index
 
     return params, invaild_new_objects_idx
 

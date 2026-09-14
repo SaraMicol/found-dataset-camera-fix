@@ -1,3 +1,9 @@
+# Config LIVE per la scena 829 -- gemello di dgsg_live.py (scena 824).
+# Generato da quel file cambiando SOLO scene_name, cosi' i due esperimenti
+# restano confrontabili: stesse soglie, stesse iterazioni, stessi fix
+# (map_every=2, tracking/mapping 20/30, use_dam=False).
+# I commenti sotto citano misure fatte sulla 824: valgono come motivazione
+# della scelta, non come dato della 829.
 import os
 from os.path import join as p_join
 
@@ -5,7 +11,7 @@ from os.path import join as p_join
 # Non e' un nome di cartella da risolvere (RosLiveDataset non legge file):
 # resta solo per costruire run_name/output_dir in modo leggibile, coerente
 # con lo schema degli altri config found/*.py.
-scene_name = "00824_live"
+scene_name = "00829_live"
 
 primary_device="cuda:0"
 seed = 0
@@ -38,7 +44,7 @@ config = dict(
     # Disattivato per la run headless: senza finestra OpenCV la pipeline non
     # deve aprire un display (utile su questa macchina/sessione, e riduce il
     # lavoro per frame). Il confronto con la GT continua a scrivere
-    # 00824_live.json via watch_live_progress.py, indipendente dal viewer.
+    # 00829_live.json via watch_live_progress.py, indipendente dal viewer.
     live_viewer=False,
     workdir=f"./experiments/{group_name}",
     run_name=run_name,
